@@ -1,3 +1,4 @@
+# imports
 from util import get_json_file_list, upload_to_s3, read_json_file, has_non_ascii
 import os
 from ollama import Client
@@ -9,58 +10,60 @@ from langchain.prompts import PromptTemplate
 import json
 import pprint
 
+# setup client
 c = Client(host="http://localhost:11434")
 
+# define validation
 class ValidationResult(BaseModel):
     is_valid: bool = Field(description="Whether the validation passed")
     feedback: str = Field(default="", description="Feedback message if validation failed, empty if valid")
 
+# define state type
 class AgentState(TypedDict):
-    dataset: list 
-    current_index: int 
-    current_element: dict 
+    original_text: str
     processed_string: str 
     validation_result: dict 
-    final_results: list 
     is_complete: bool
     iteration_count: int
     max_iterations: int
 
+# clean text
 def remove_non_ascii(input_string: str) -> str:
-    # strip non-ASCII chars
     return input_string.encode('ascii', 'ignore').decode('ascii')
 
+# call llm
 def invoke_client(query, **generate_kwargs):
-    # call ollama API
     return c.generate(model="llama3.2", prompt=query, **generate_kwargs)["response"]
 
+# convert to dict
 def pydantic_to_dict(model: BaseModel) -> dict:
     if hasattr(model, "model_dump"):
-        # newer pydantic
         return model.model_dump()
-    # older pydantic
     return model.dict()
 
+# get structured response
 def invoke_structured_client(prompt: str) -> ValidationResult:
-    # force JSON output
     response = invoke_client(prompt, format="json")
     output_parser = PydanticOutputParser(pydantic_object=ValidationResult)
-    # parse structured response
-    return output_parser.parse(response)
+    try:
+        return output_parser.parse(response)
+    except Exception as e:
+        return ValidationResult(is_valid=False, feedback=str(e))
 
+# get prompt text
 def prompt(query):
     prompt = """
     You are an expert text editor. Rewrite the input text into fluent, well-structured, grammatically correct English while preserving its original meaning and tone.
 
     Rules:
     1. Fix grammar, spelling, and punctuation.
-    2. Expand slang and shorthand into standard English unless part of the intended tone.
-    3. Preserve the tone — casual stays conversational, but never sloppy.
-    4. Remove extraneous characters, broken encodings, filler words, repeated letters, and emojis.
-    5. Capitalize appropriately and ensure proper sentence boundaries.
-    6. Condense where possible without removing meaning.
-    7. Do not alter factual content.
-    8. Recognize proper nouns and do not change them.
+    2. Preserve the tone — casual stays conversational, but never sloppy.
+    3. Remove extraneous characters, broken encodings, filler words, repeated letters, and emojis.
+    4. Capitalize appropriately and ensure proper sentence boundaries.
+    5. Condense where possible without removing meaning.
+    6. Do not alter factual content.
+    7. Recognize proper nouns and do not change them.
+    8. Do not paraphrase anything. Do a word to word translation.
 
     Output format:
     - Return only the rewritten sentence.
@@ -87,8 +90,8 @@ def prompt(query):
     """
     return prompt.format(query=query)
 
+# load data
 def create_finetune_data():
-    # get bucket name
     bucket = os.getenv("USER_MESSAGES_BUCKET")
     if not bucket:
         return []
@@ -98,60 +101,30 @@ def create_finetune_data():
     for file_name in file_list:
         try:
             response = read_json_file(bucket, file_name) or {}
-            # extract message data
             user_messages = response.get("data", [])
             if not isinstance(user_messages, list):
                 continue
-            # filter strings only
             messages.extend([m for m in user_messages if isinstance(m, str)])
         except Exception as e:
             pass
 
     dataset = []
-    for message in messages[:100]:
-        # limit to 50 messages
+    for message in messages:
         message = remove_non_ascii(message)
-        # create training pairs
-        dataset.append({"original": message, "cleaned": invoke_client(prompt(message))})
+        dataset.append({"original": message})
 
     return dataset
 
+# process text
 def processor_node(state: AgentState) -> AgentState:
-    """Node that handles dataset initialization and element processing."""
-    # Initialize dataset if needed
-    if not state.get("dataset"):
-        dataset = create_finetune_data()
-        if not dataset:
-            return {**state, "is_complete": True}
-        # Initialize with first element
-        first_element = dataset[0]
-        processed_string = invoke_client(prompt(first_element["original"]))
-        return {
-            **state,
-            "dataset": dataset,
-            "current_index": 0,
-            "current_element": first_element,
-            "processed_string": processed_string,
-            "final_results": [],
-            "is_complete": False,
-            "iteration_count": 1,  # First attempt
-            "max_iterations": 3
-        }
-    
-    # Check if we're done with all elements
-    if state["current_index"] >= len(state["dataset"]):
-        return {**state, "is_complete": True}
-    
-    current_element = state["dataset"][state["current_index"]]
+    original_text = state["original_text"]
     current_iterations = state.get("iteration_count", 0)
     
-    # Process element (with retry logic if needed)
     if current_iterations > 0 and state.get("validation_result", {}).get("feedback"):
-        # Retry with feedback
         feedback = state["validation_result"]["feedback"]
         previous_attempt = state.get("processed_string", "")
         enhanced_prompt = f"""
-        {prompt(current_element["original"])}
+        {prompt(original_text)}
         
         Previous attempt: {previous_attempt}
         Previous attempt feedback: {feedback}
@@ -162,30 +135,19 @@ def processor_node(state: AgentState) -> AgentState:
         """
         processed_string = invoke_client(enhanced_prompt)
     else:
-        # First attempt
-        processed_string = invoke_client(prompt(current_element["original"]))
+        processed_string = invoke_client(prompt(original_text))
     
     return {
         **state,
-        "current_element": current_element,
         "processed_string": processed_string,
         "iteration_count": current_iterations + 1,
     }
 
+# validate text
 def validator_node(state: AgentState) -> AgentState:
-    """Node that validates processed text and manages workflow decisions."""
-    if state.get("is_complete", False) or state["current_index"] >= len(state.get("dataset", [])):
-        return {**state, "is_complete": True}
-
-    # Safety check - current_element should be set by processor_node
-    if not state.get("current_element") or "original" not in state["current_element"]:
-        print(f"Warning: current_element not properly set: {state.get('current_element')}")
-        return {**state, "is_complete": True}
-
-    original = state["current_element"]["original"]
+    original_text = state["original_text"]
     processed_string = state["processed_string"]
     
-    # Validate the processed string
     validation_prompt = f"""
     You are a validation system that checks if a rewritten sentence correctly follows the transformation rules.
 
@@ -199,7 +161,7 @@ def validator_node(state: AgentState) -> AgentState:
 
     Task: Validate if the rewritten text follows all transformation rules.
 
-    Input: {original}
+    Input: {original_text}
     Output: {processed_string}
 
     Analyze the text and provide your validation decision.
@@ -215,94 +177,106 @@ def validator_node(state: AgentState) -> AgentState:
     current_iterations = state.get("iteration_count", 1)
     max_iterations = state.get("max_iterations", 3)
     
-    # Decide what to do next
     if validation_result.is_valid or current_iterations >= max_iterations:
-        # Accept result and move to next element
-        new_result = {
-            "original": state["current_element"]["original"],
-            "processed": processed_string,
-        }
-        
         return {
             **state,
-            "final_results": state["final_results"] + [new_result],
-            "current_index": state["current_index"] + 1,
-            "iteration_count": 0,  # Reset for next element
-            "validation_result": {},
-            "processed_string": "",
+            "is_complete": True,
+            "validation_result": pydantic_to_dict(validation_result),
         }
     else:
-        # Keep feedback for retry
         return {
             **state,
+            "is_complete": False,
             "validation_result": pydantic_to_dict(validation_result),
         }
 
-def should_continue_two_nodes(state: AgentState) -> str:
-    """Routing function for two-node workflow."""
+# check retry
+def should_continue_single_item(state: AgentState) -> str:
     if state.get("is_complete", False):
         return "END"
     
-    # If we have validation result that failed and haven't hit max retries
     validation_result = state.get("validation_result", {})
-    if (validation_result.get("is_valid") == False and 
-        state.get("iteration_count", 0) < state.get("max_iterations", 3)):
+    if not validation_result.get("is_valid") and state.get("iteration_count", 0) < state.get("max_iterations", 3):
         return "retry"
     
-    # Otherwise continue to next element
-    return "next"
+    return "END"
 
-def orchestrate():
-    # create workflow graph with 2 nodes
+# process one text
+def process_single_item(original_text: str) -> dict:
     workflow = StateGraph(AgentState)
     
     workflow.add_node("processor", processor_node)
     workflow.add_node("validator", validator_node)
-    
     workflow.set_entry_point("processor")
-    
-    # processor always goes to validator
     workflow.add_edge("processor", "validator")
     
-    # validator decides what to do next
     workflow.add_conditional_edges(
         "validator",
-        should_continue_two_nodes,
+        should_continue_single_item,
         {
-            "retry": "processor",  # retry current element
-            "next": "processor",   # move to next element
+            "retry": "processor",
             "END": END
         }
     )
     
-    # compile workflow
     app = workflow.compile()
     
     initial_state = {
-        "dataset": [],
-        "current_index": 0,
-        "final_results": [],
+        "original_text": original_text,
+        "processed_string": "",
+        "validation_result": {},
         "is_complete": False,
+        "iteration_count": 0,
         "max_iterations": 3
     }
     
     try:
-        # run workflow with properly increased recursion limit
-        # 2 nodes per iteration: 100 elements × 3 retries × 2 nodes + overhead
-        result = app.invoke(initial_state, config={"recursion_limit": 800})
-
-        pprint.pprint(result["final_results"])
-
-        # Upload to s3
-        # upload_to_s3(os.getenv("FINE_TUNE_DATA_BUCKET"), "finetune_data.json", {"data": result["final_results"]})
-
-        # Return results
-        return result
+        result = app.invoke(initial_state, config={"recursion_limit": 10})
+        return {
+            "original": original_text,
+            "processed": result["processed_string"],
+            "validation_result": result.get("validation_result", {}),
+            "iterations_used": result.get("iteration_count", 0)
+        }
     except Exception as e:
-        import traceback
-        # debug errors
-        traceback.print_exc()
+        return {
+            "original": original_text,
+            "processed": original_text,
+            "validation_result": {"is_valid": False, "feedback": str(e)},
+            "iterations_used": 0
+        }
+
+# run workflow
+def orchestrate():
+    dataset = create_finetune_data()
+    if not dataset:
         return None
+    
+    BATCH_SIZE = 1000
+    total_items = len(dataset)
+    processed_count = 0
+    batch_number = 0
+    while processed_count < total_items:
+        batch_start = processed_count
+        batch_end = min(processed_count + BATCH_SIZE, total_items)
+        current_batch = dataset[batch_start:batch_end]
+        
+        batch_results = []
+        for item in current_batch:
+            original_text = item["original"]
+            result = process_single_item(original_text)
+            batch_results.append(result)
+        try:
+            batch_filename = f"finetune_data_batch_{batch_number}.json"
+            upload_to_s3(os.getenv("FINE_TUNE_DATA_BUCKET"), batch_filename, {"data": batch_results})
+            print(f"Batch {batch_number + 1}: {batch_start} to {batch_end} of {total_items}")
+        except Exception as e:
+            return {"final_results": batch_results, "error": str(e)}
+        
+        processed_count += len(current_batch)
+        batch_number += 1
+    
+    return {"total_processed": processed_count, "total_batches": batch_number}
 
 if __name__ == "__main__":
     orchestrate()
