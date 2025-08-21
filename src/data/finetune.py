@@ -1,4 +1,6 @@
 # imports
+import sys
+from tqdm import tqdm
 from util import get_json_file_list, upload_to_s3, read_json_file, has_non_ascii
 import os
 from ollama import Client
@@ -11,7 +13,9 @@ import json
 import pprint
 
 # setup client
-c = Client(host="http://localhost:11434")
+ollama_client = Client(host="http://localhost:11434")
+start = int(sys.argv[1])
+end = int(sys.argv[2])
 
 # define validation
 class ValidationResult(BaseModel):
@@ -33,7 +37,7 @@ def remove_non_ascii(input_string: str) -> str:
 
 # call llm
 def invoke_client(query, **generate_kwargs):
-    return c.generate(model="llama3.2", prompt=query, **generate_kwargs)["response"]
+    return ollama_client.generate(model="llama3.2", prompt=query, **generate_kwargs)["response"]
 
 # convert to dict
 def pydantic_to_dict(model: BaseModel) -> dict:
@@ -108,8 +112,12 @@ def create_finetune_data():
         except Exception as e:
             pass
 
+    # Get range from command line args
+    messages = messages[start:end]
+    print(f"Processing {len(messages)} messages from range {start} to {end}")
+    
     dataset = []
-    for message in messages:
+    for message in tqdm(messages, desc="Preparing dataset"):
         message = remove_non_ascii(message)
         dataset.append({"original": message})
 
@@ -252,7 +260,7 @@ def orchestrate():
     if not dataset:
         return None
     
-    BATCH_SIZE = 1000
+    BATCH_SIZE = 500
     total_items = len(dataset)
     processed_count = 0
     batch_number = 0
@@ -262,12 +270,12 @@ def orchestrate():
         current_batch = dataset[batch_start:batch_end]
         
         batch_results = []
-        for item in current_batch:
+        for item in tqdm(current_batch, desc=f"Processing batch {processed_count//BATCH_SIZE + 1}"):
             original_text = item["original"]
             result = process_single_item(original_text)
             batch_results.append(result)
         try:
-            batch_filename = f"finetune_data_batch_{batch_number}.json"
+            batch_filename = f"finetune_data_batch_{start}_{batch_number}.json"
             upload_to_s3(os.getenv("FINE_TUNE_DATA_BUCKET"), batch_filename, {"data": batch_results})
             print(f"Batch {batch_number + 1}: {batch_start} to {batch_end} of {total_items}")
         except Exception as e:
